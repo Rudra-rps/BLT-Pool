@@ -5753,6 +5753,58 @@ async def _verify_gh_user_exists(username: str, env=None) -> bool:
         return True  # Fail open: don't block when GitHub API is temporarily unavailable
 
 
+async def handle_get_assignments(request, env) -> "Response":
+    """GET /api/assignments — return active mentor assignments."""
+    # TODO: Add authentication (e.g., API key or GitHub App validation)
+    # before exposing this endpoint in production environments.
+
+    db = _d1_binding(env)
+    if not db:
+        return _json(
+            {"error": "failed_to_fetch_assignments", "message": "Database not available"},
+            500,
+        )
+
+    org = getattr(env, "GITHUB_ORG", "OWASP-BLT")
+
+    def _to_iso8601(value) -> str:
+        if isinstance(value, (int, float)):
+            ts = int(value)
+        elif isinstance(value, str):
+            s = value.strip()
+            if s.isdigit():
+                ts = int(s)
+            else:
+                return s
+        else:
+            return ""
+        if ts <= 0:
+            return ""
+        try:
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+        except Exception:
+            return ""
+
+    try:
+        rows = await _d1_get_active_assignments(db, org)
+        assignments = [
+            {
+                "mentor_login": str(row.get("mentor_login") or ""),
+                "mentee_login": str(row.get("mentee_login") or ""),
+                "issue_number": int(row.get("issue_number") or 0),
+                "repo": str(row.get("issue_repo") or ""),
+                "created_at": _to_iso8601(row.get("assigned_at")),
+            }
+            for row in rows
+        ]
+        return _json({"assignments": assignments, "count": len(assignments)}, 200)
+    except Exception as e:
+        return _json(
+            {"error": "failed_to_fetch_assignments", "message": str(e)},
+            500,
+        )
+
+
 async def _handle_add_mentor(request, env) -> "Response":
     """POST /api/mentors — insert a new mentor into the D1 mentors table.
 
@@ -5958,6 +6010,9 @@ async def on_fetch(request, env) -> Response:
                 },
             }
         )
+
+    if method == "GET" and path == "/api/assignments":
+        return await handle_get_assignments(request, env)
 
     if method == "POST" and path == "/api/mentors":
         return await _handle_add_mentor(request, env)

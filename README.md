@@ -203,6 +203,34 @@ Validation implemented in `worker.py`:
 - Invalid payloads return `400`
 - Successful inserts return `201`
 
+### Assignments API
+
+Returns active mentor assignments from D1.
+
+#### Endpoint
+
+- GET /api/assignments
+
+#### Response
+
+```json
+{
+  "assignments": [
+    {
+      "mentor_login": "mentor",
+      "mentee_login": "mentee",
+      "issue_number": 123,
+      "repo": "repo-name",
+      "created_at": "2026-03-24T10:15:30Z"
+    }
+  ],
+  "count": 1
+}
+
+Notes
+- Data is sourced from the mentor_assignments table in D1
+- This endpoint is currently unauthenticated and intended for integration use
+
 ## Seeded Mentors
 
 The worker currently seeds an initial mentor pool in code so the homepage is populated on first run. This seeded list includes mentors such as:
