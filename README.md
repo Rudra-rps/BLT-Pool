@@ -42,6 +42,7 @@ The app runs as a Python Cloudflare Worker. D1 is used for both the leaderboard 
 
 - `GET /` renders the BLT-Pool mentor directory.
 - `GET /github-app` renders the GitHub App landing page.
+- `GET /api/assignments` returns active mentor assignments from D1.
 - `POST /api/mentors` adds a mentor to the D1-backed mentor pool.
 - `POST /api/github/webhooks` receives GitHub webhook events.
 - `GET /health` returns a health check response.

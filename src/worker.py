@@ -844,11 +844,11 @@ async def _d1_get_mentor_loads(db, org: str) -> dict:
         return {}
 
 
-async def _d1_get_active_assignments(db, org: str) -> list:
+async def _d1_get_active_assignments(db, org: str, fail_open: bool = True) -> list:
     """Return all active mentor assignments from D1 for the given org.
 
     Returns a list of dicts with keys: org, mentor_login, mentee_login, issue_repo, issue_number, assigned_at.
-    Returns an empty list when D1 is unavailable or the query fails.
+    Returns an empty list when D1 is unavailable or the query fails (fail_open=True).
     """
     try:
         rows = await _d1_all(
@@ -875,7 +875,9 @@ async def _d1_get_active_assignments(db, org: str) -> list:
         ]
     except Exception as exc:
         console.error(f"[D1] Failed to get active assignments: {exc}")
-        return []
+        if fail_open:
+            return []
+        raise
 
 
 def _time_ago(ts: int) -> str:
@@ -5786,7 +5788,7 @@ async def handle_get_assignments(request, env) -> "Response":
             return ""
 
     try:
-        rows = await _d1_get_active_assignments(db, org)
+        rows = await _d1_get_active_assignments(db, org, fail_open=False)
         assignments = [
             {
                 "mentor_login": str(row.get("mentor_login") or ""),
@@ -5799,8 +5801,9 @@ async def handle_get_assignments(request, env) -> "Response":
         ]
         return _json({"assignments": assignments, "count": len(assignments)}, 200)
     except Exception as e:
+        console.error(f"[Assignments] Failed to fetch assignments: {e}")
         return _json(
-            {"error": "failed_to_fetch_assignments", "message": str(e)},
+            {"error": "failed_to_fetch_assignments", "message": "Failed to fetch assignments"},
             500,
         )
 
