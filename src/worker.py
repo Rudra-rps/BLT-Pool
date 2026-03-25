@@ -20,6 +20,13 @@ Environment variables / secrets (configure via ``wrangler.toml`` or
     BLT_API_URL        — BLT API base URL (default: https://blt-api.owasp-blt.workers.dev)
     GITHUB_CLIENT_ID   — OAuth client ID (optional)
     GITHUB_CLIENT_SECRET — OAuth client secret (optional)
+    CORS_ALLOWED_ORIGINS — Comma/space-separated list of allowed CORS origins (optional)
+    API_KEY            — Bearer/API key required for GET /api/assignments (secret)
+    MENTOR_FORM_KEY    — Public token accepted for POST /api/mentors (optional)
+    RATE_LIMIT_WINDOW_SECONDS — Rate limit window in seconds (default: 60)
+    RATE_LIMIT_ASSIGNMENTS_MAX — Max requests/window for /api/assignments (default: 60)
+    RATE_LIMIT_MENTOR_SIGNUP_MAX — Max requests/window for /api/mentors (default: 30)
+    RATE_LIMIT_KV      — KV binding for distributed rate limiting (optional)
 """
 
 import base64
@@ -62,6 +69,9 @@ ASSIGNMENT_DURATION_HOURS = 8
 BUG_LABELS = {"bug", "vulnerability", "security"}
 HELP_WANTED_LABEL = "help wanted"
 TRIAGE_REVIEWER = "donnieblt"
+
+# Best-effort local rate limit store when KV is not configured.
+_LOCAL_RATE_LIMIT = {}
 
 # ---------------------------------------------------------------------------
 # Mentor pool — slash commands and label names
@@ -5139,7 +5149,13 @@ def _build_referral_leaderboard(mentors: list) -> list:
     return sorted(counts.items(), key=lambda x: x[1], reverse=True)
 
 
-def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, active_assignments: Optional[list] = None, assignment_comment_stats: Optional[dict] = None) -> str:
+def _index_html(
+    mentors: list = None,
+    mentor_stats: Optional[dict] = None,
+    active_assignments: Optional[list] = None,
+    assignment_comment_stats: Optional[dict] = None,
+    mentor_form_key: str = "",
+) -> str:
     """Generate the BLT-Pool mentor directory homepage.
 
     Args:
@@ -5289,6 +5305,7 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
           <p class="text-sm text-gray-500">No referrals yet — be the first to invite a mentor!</p>
         </section>'''
 
+    mentor_form_key_js = json.dumps(mentor_form_key or "")
     return f'''<!DOCTYPE html>
 <html lang="en" class="scroll-smooth">
 <head>
@@ -5567,6 +5584,11 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
           var GH_USERNAME_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9\\-]{{0,37}}[a-zA-Z0-9])?$/;
           // Regex matching each specialty tag (identical to server-side _SPECIALTY_RE).
           var SPECIALTY_RE = /^[a-z0-9][a-z0-9+#.\\-]{{0,29}}$/;
+          var mentorFormKey = {mentor_form_key_js};
+          var mentorHeaders = {{'Content-Type': 'application/json'}};
+          if (mentorFormKey) {{
+            mentorHeaders['X-Mentor-Form-Key'] = mentorFormKey;
+          }}
 
           /**
            * Return true if the value contains HTML angle brackets, raw ampersands,
@@ -5666,7 +5688,7 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
             btn.disabled = true;
             fetch('/api/mentors', {{
               method: 'POST',
-              headers: {{'Content-Type': 'application/json'}},
+              headers: mentorHeaders,
               body: JSON.stringify({{
                 name: name,
                 github_username: github,
@@ -5756,15 +5778,43 @@ async def _verify_gh_user_exists(username: str, env=None) -> bool:
 
 
 async def handle_get_assignments(request, env) -> "Response":
-    """GET /api/assignments — return active mentor assignments."""
-    # TODO: Add authentication (e.g., API key or GitHub App validation)
-    # before exposing this endpoint in production environments.
+    """GET /api/assignments ??? return active mentor assignments."""
+    rate_window = _coerce_int(getattr(env, "RATE_LIMIT_WINDOW_SECONDS", 60), 60)
+    rate_max = _coerce_int(getattr(env, "RATE_LIMIT_ASSIGNMENTS_MAX", 60), 60)
+    allowed, rate_headers = await _rate_limit_check(
+        request,
+        env,
+        scope="assignments",
+        max_requests=rate_max,
+        window_seconds=rate_window,
+    )
+    if not allowed:
+        return _json_cors(
+            {"error": "rate_limited", "message": "Too many requests"},
+            429,
+            request,
+            env,
+            rate_headers,
+        )
+
+    ok, err = _check_api_key(request, env)
+    if not ok:
+        return _json_cors(
+            {"error": "unauthorized", "message": err or "Unauthorized"},
+            401,
+            request,
+            env,
+            rate_headers,
+        )
 
     db = _d1_binding(env)
     if not db:
-        return _json(
+        return _json_cors(
             {"error": "failed_to_fetch_assignments", "message": "Database not available"},
             500,
+            request,
+            env,
+            rate_headers,
         )
 
     org = getattr(env, "GITHUB_ORG", "OWASP-BLT")
@@ -5799,17 +5849,26 @@ async def handle_get_assignments(request, env) -> "Response":
             }
             for row in rows
         ]
-        return _json({"assignments": assignments, "count": len(assignments)}, 200)
+        return _json_cors(
+            {"assignments": assignments, "count": len(assignments)},
+            200,
+            request,
+            env,
+            rate_headers,
+        )
     except Exception as e:
         console.error(f"[Assignments] Failed to fetch assignments: {e}")
-        return _json(
+        return _json_cors(
             {"error": "failed_to_fetch_assignments", "message": "Failed to fetch assignments"},
             500,
+            request,
+            env,
+            rate_headers,
         )
 
 
 async def _handle_add_mentor(request, env) -> "Response":
-    """POST /api/mentors — insert a new mentor into the D1 mentors table.
+    """POST /api/mentors ??? insert a new mentor into the D1 mentors table.
 
     Expected JSON body::
 
@@ -5824,10 +5883,41 @@ async def _handle_add_mentor(request, env) -> "Response":
 
     Returns 201 on success, 400 on validation failure, 500 on DB error.
     """
+    rate_window = _coerce_int(getattr(env, "RATE_LIMIT_WINDOW_SECONDS", 60), 60)
+    rate_max = _coerce_int(getattr(env, "RATE_LIMIT_MENTOR_SIGNUP_MAX", 30), 30)
+    allowed, rate_headers = await _rate_limit_check(
+        request,
+        env,
+        scope="mentor_signup",
+        max_requests=rate_max,
+        window_seconds=rate_window,
+    )
+    if not allowed:
+        return _json_cors(
+            {"error": "rate_limited", "message": "Too many requests"},
+            429,
+            request,
+            env,
+            rate_headers,
+        )
+
+    ok, err = _check_mentor_form_key(request, env)
+    if not ok:
+        return _json_cors(
+            {"error": "unauthorized", "message": err or "Unauthorized"},
+            401,
+            request,
+            env,
+            rate_headers,
+        )
+
+    def _resp(data, status: int) -> Response:
+        return _json_cors(data, status, request, env, rate_headers)
+
     try:
         body = json.loads(await request.text())
     except Exception:
-        return _json({"error": "Invalid JSON body"}, 400)
+        return _resp({"error": "Invalid JSON body"}, 400)
 
     name = (body.get("name") or "").strip()
     github_username = (body.get("github_username") or "").strip().lstrip("@")
@@ -5837,19 +5927,19 @@ async def _handle_add_mentor(request, env) -> "Response":
     referred_by = (body.get("referred_by") or "").strip().lstrip("@")
 
     if not name:
-        return _json({"error": "Field 'name' is required"}, 400)
+        return _resp({"error": "Field 'name' is required"}, 400)
     if not _NAME_RE.match(name):
-        return _json({"error": "Display name contains invalid characters (HTML and scripting are not allowed)"}, 400)
+        return _resp({"error": "Display name contains invalid characters (HTML and scripting are not allowed)"}, 400)
     if not github_username:
-        return _json({"error": "Field 'github_username' is required"}, 400)
+        return _resp({"error": "Field 'github_username' is required"}, 400)
     if not _GH_USERNAME_RE.match(github_username):
-        return _json({"error": "Invalid GitHub username format"}, 400)
+        return _resp({"error": "Invalid GitHub username format"}, 400)
 
     # Verify the GitHub username actually exists.
     if not await _verify_gh_user_exists(github_username, env):
-        return _json({"error": f"GitHub username '{github_username}' was not found on GitHub"}, 400)
+        return _resp({"error": f"GitHub username '{github_username}' was not found on GitHub"}, 400)
 
-    # Normalise specialties — accept a list or a comma-separated string.
+    # Normalise specialties ??? accept a list or a comma-separated string.
     if isinstance(specialties_raw, str):
         specialties = [s.strip() for s in specialties_raw.split(",") if s.strip()]
     elif isinstance(specialties_raw, list):
@@ -5859,7 +5949,7 @@ async def _handle_add_mentor(request, env) -> "Response":
     # Validate each specialty tag.
     for spec in specialties:
         if not _SPECIALTY_RE.match(spec):
-            return _json({"error": f"Invalid specialty tag: {spec!r}"}, 400)
+            return _resp({"error": f"Invalid specialty tag: {spec!r}"}, 400)
 
     try:
         max_mentees = max(_MENTOR_MIN_MENTEES_CAP, min(_MENTOR_MAX_MENTEES_CAP, int(max_mentees)))
@@ -5867,18 +5957,18 @@ async def _handle_add_mentor(request, env) -> "Response":
         max_mentees = 3
 
     if timezone and not _TIMEZONE_RE.match(timezone):
-        return _json({"error": "Timezone contains invalid characters (HTML and scripting are not allowed)"}, 400)
+        return _resp({"error": "Timezone contains invalid characters (HTML and scripting are not allowed)"}, 400)
 
     if referred_by and not _GH_USERNAME_RE.match(referred_by):
-        return _json({"error": "Invalid referred_by username format"}, 400)
+        return _resp({"error": "Invalid referred_by username format"}, 400)
 
     # Verify the referrer's GitHub username exists (if provided).
     if referred_by and not await _verify_gh_user_exists(referred_by, env):
-        return _json({"error": f"Referred-by username '{referred_by}' was not found on GitHub"}, 400)
+        return _resp({"error": f"Referred-by username '{referred_by}' was not found on GitHub"}, 400)
 
     db = _d1_binding(env)
     if not db:
-        return _json({"error": "Database not available"}, 500)
+        return _resp({"error": "Database not available"}, 500)
 
     mentor_is_active = await has_merged_pr_in_org(
         env,
@@ -5893,10 +5983,10 @@ async def _handle_add_mentor(request, env) -> "Response":
             (github_username,),
         )
         if existing:
-            return _json({"error": f"GitHub user '{github_username}' is already in the mentor pool"}, 409)
+            return _resp({"error": f"GitHub user '{github_username}' is already in the mentor pool"}, 409)
     except Exception as exc:
         console.error(f"[MentorPool] Failed to check duplicate mentor {github_username}: {exc}")
-        return _json({"error": "Failed to validate mentor. Please try again later."}, 500)
+        return _resp({"error": "Failed to validate mentor. Please try again later."}, 500)
 
     try:
         await _ensure_leaderboard_schema(db)
@@ -5912,12 +6002,12 @@ async def _handle_add_mentor(request, env) -> "Response":
         )
     except Exception as exc:
         console.error(f"[MentorPool] Failed to add mentor {github_username}: {exc}")
-        return _json({"error": "Failed to save mentor"}, 500)
+        return _resp({"error": "Failed to save mentor"}, 500)
 
     console.log(
         f"[MentorPool] Added mentor {github_username} via API active={mentor_is_active}"
     )
-    return _json(
+    return _resp(
         {"ok": True, "github_username": github_username, "active": mentor_is_active},
         201,
     )
@@ -5928,14 +6018,149 @@ async def _handle_add_mentor(request, env) -> "Response":
 # ---------------------------------------------------------------------------
 
 
-def _json(data, status: int = 200) -> Response:
+def _split_env_list(raw: str) -> list:
+    if not raw:
+        return []
+    return [item for item in re.split(r"[,\s]+", raw.strip()) if item]
+
+
+def _cors_allowed_origins(env) -> set:
+    raw = getattr(env, "CORS_ALLOWED_ORIGINS", "") if env else ""
+    return set(_split_env_list(raw))
+
+
+def _cors_origin(request, env) -> str:
+    origin = (request.headers.get("Origin") or "").strip() if request else ""
+    if not origin:
+        return ""
+    allowed = _cors_allowed_origins(env)
+    if not allowed:
+        return ""
+    if "*" in allowed:
+        return origin
+    allowed_lower = {o.lower() for o in allowed}
+    return origin if origin.lower() in allowed_lower else ""
+
+
+def _cors_headers(request, env, allow_methods: str = "", allow_headers: str = "") -> dict:
+    origin = _cors_origin(request, env)
+    if not origin:
+        return {}
+    headers = {
+        "Access-Control-Allow-Origin": origin,
+        "Vary": "Origin",
+    }
+    if allow_methods:
+        headers["Access-Control-Allow-Methods"] = allow_methods
+    if allow_headers:
+        headers["Access-Control-Allow-Headers"] = allow_headers
+    return headers
+
+
+def _json_cors(data, status: int, request, env, extra_headers: Optional[dict] = None) -> Response:
+    headers = _cors_headers(request, env)
+    if extra_headers:
+        headers.update(extra_headers)
+    return _json(data, status, headers=headers)
+
+
+def _coerce_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_client_ip(request) -> str:
+    if not request:
+        return "unknown"
+    ip = (request.headers.get("CF-Connecting-IP") or "").strip()
+    if not ip:
+        ip = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    return ip or "unknown"
+
+
+async def _rate_limit_check(request, env, scope: str, max_requests: int, window_seconds: int) -> Tuple[bool, dict]:
+    if max_requests <= 0 or window_seconds <= 0:
+        return True, {}
+    now = int(time.time())
+    window_start = now - (now % window_seconds)
+    reset = window_start + window_seconds
+    key = f"rate:{scope}:{_get_client_ip(request)}:{window_start}"
+
+    kv = getattr(env, "RATE_LIMIT_KV", None) if env else None
+    count = 0
+    if kv:
+        try:
+            stored = await kv.get(key)
+            count = int(stored) if stored and str(stored).isdigit() else 0
+            count += 1
+            await kv.put(key, str(count), expirationTtl=window_seconds + 1)
+        except Exception as exc:
+            console.error(f"[RateLimit] KV error: {exc}")
+            return True, {}
+    else:
+        # Clean up expired entries opportunistically.
+        expired = [k for k, v in _LOCAL_RATE_LIMIT.items() if v[1] <= now]
+        for k in expired:
+            _LOCAL_RATE_LIMIT.pop(k, None)
+        count, _ = _LOCAL_RATE_LIMIT.get(key, (0, reset))
+        count += 1
+        _LOCAL_RATE_LIMIT[key] = (count, reset)
+
+    remaining = max(0, max_requests - count)
+    headers = {
+        "X-RateLimit-Limit": str(max_requests),
+        "X-RateLimit-Remaining": str(remaining),
+        "X-RateLimit-Reset": str(reset),
+    }
+    if count > max_requests:
+        headers["Retry-After"] = str(max(0, reset - now))
+        return False, headers
+    return True, headers
+
+
+def _get_bearer_token(request) -> str:
+    if not request:
+        return ""
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
+
+
+def _check_api_key(request, env) -> Tuple[bool, str]:
+    api_key = getattr(env, "API_KEY", "") if env else ""
+    if not api_key:
+        return True, ""
+    token = _get_bearer_token(request)
+    if not token:
+        token = (request.headers.get("X-API-Key") or request.headers.get("X-Api-Key") or "").strip()
+    if token == api_key:
+        return True, ""
+    return False, "Invalid or missing API key"
+
+
+def _check_mentor_form_key(request, env) -> Tuple[bool, str]:
+    form_key = getattr(env, "MENTOR_FORM_KEY", "") if env else ""
+    if not form_key:
+        return True, ""
+    token = _get_bearer_token(request)
+    if not token:
+        token = (request.headers.get("X-Mentor-Form-Key") or "").strip()
+    if token == form_key:
+        return True, ""
+    return False, "Invalid or missing mentor form key"
+
+
+def _json(data, status: int = 200, headers: Optional[dict] = None) -> Response:
+    merged = {"Content-Type": "application/json"}
+    if headers:
+        merged.update(headers)
     return Response.new(
         json.dumps(data),
         status=status,
-        headers=Headers.new({
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
-        }.items()),
+        headers=Headers.new(merged.items()),
     )
 
 
@@ -5959,6 +6184,15 @@ async def on_fetch(request, env) -> Response:
     admin_response = await AdminService(env).handle(request)
     if admin_response is not None:
         return admin_response
+
+    if method == "OPTIONS" and path in ("/api/assignments", "/api/mentors"):
+        allow_methods = "GET, OPTIONS" if path == "/api/assignments" else "POST, OPTIONS"
+        allow_headers = "Content-Type, Authorization, X-API-Key, X-Mentor-Form-Key"
+        headers = _cors_headers(request, env, allow_methods=allow_methods, allow_headers=allow_headers)
+        if headers:
+            headers["Access-Control-Max-Age"] = "600"
+            return Response.new("", status=204, headers=Headers.new(headers.items()))
+        return Response.new("", status=204)
 
     if method == "GET" and path == "/":
         # Load mentors from D1.
@@ -5996,7 +6230,8 @@ async def on_fetch(request, env) -> Response:
                     assignment_comment_stats = await _d1_get_user_comment_totals(db, org, all_logins)
                 except Exception as exc:
                     console.error(f"[MentorPool] Failed to fetch assignment comment stats: {exc}")
-        return _html(_index_html(mentors, mentor_stats, active_assignments, assignment_comment_stats))
+        mentor_form_key = getattr(env, "MENTOR_FORM_KEY", "")
+        return _html(_index_html(mentors, mentor_stats, active_assignments, assignment_comment_stats, mentor_form_key))
 
     if method == "GET" and path == "/github-app":
         app_slug = getattr(env, "GITHUB_APP_SLUG", "")
